@@ -50,10 +50,6 @@ cd Flow_Consumption_Tool
 chmod +x continuous_download.sh
 ./continuous_download.sh
 ```
-Non-interactive:
-```bash
-./continuous_download.sh run &
-```
 
 ## Disclaimer
 Provided "AS IS" without any warranty. Use at your own risk.
