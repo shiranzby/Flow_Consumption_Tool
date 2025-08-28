@@ -8,7 +8,7 @@ Scheduled, rate‑limited, multi-threaded downstream traffic generator to keep a
 
 ## Feature Summary
 - Multi-thread concurrency: primary traffic threads (THREADS) + dedicated large-file threads (EXTRA_BACKUP_THREAD)
-- Daily time windows: 1–3 segments; 3rd may roll past midnight
+- Daily time windows: 3 segments; 3rd may roll past midnight
 - Tiered URL strategy: primary → secondary → rotating large-file list
 - Retry with backoff: RETRY_COUNT / RETRY_DELAY
 - Per-download rate limiting: `curl --limit-rate` (MB/s)
@@ -57,5 +57,3 @@ Non-interactive:
 
 ## Disclaimer
 Provided "AS IS" without any warranty. Use at your own risk.
-
-Language switch: see top links or open `README.md` for Simplified Chinese.
