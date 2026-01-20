@@ -1,4 +1,4 @@
-# Flow Consumption Tool / 流量消耗工具 (v1.1)
+# Flow Consumption Tool / 流量消耗工具 (v2.0)
 
 简体中文 | [English](README.en.md)
 
@@ -13,60 +13,42 @@
 
 ---
 
-## v1.1 版本更新特性 (New Features)
-
-本版本 (v1.1) 在原版基础上进行了重要功能增强：
-
-1.  **详细的流量日志监控 (Traffic Logging & Stats)**
-    *   脚本同级目录下自动生成日志文件，方便每日核对。
-    *   **小时级日志 (`traffic_hourly.log`)**：记录每小时的流量使用情况。
-        *   格式：`hh/mm/ss-hh/mm/ss 消耗流量共 XX GB 平均每秒 XX MB`。
-        *   未启动检测：若某时段流量极低，标记为“没启动”。
-        *   自动维护：保留最近约 7 天的数据。
-    *   **天级汇总日志 (`traffic_daily.log`)**：记录每天的总消耗。
-        *   格式：`yyyy/mm/dd：消耗流量共 XX GB 平均每秒速度 XX MB`。
-        *   自动维护：保留最近 30 天的数据。
-
-2.  **总量限速模式 (Total Bandwidth Limit)**
-    *   **变更**：将原先的“单线程限速”改为“**总限速均分**”。
-    *   **逻辑**：设定 `LIMIT_MBPS` 为总带宽限制，脚本会自动根据当前活跃的线程数计算每个线程的限速值，并精确到小数点后两位。
-    *   **示例**：设置限速 20MB/s，若当前有 4 个线程工作，则每个线程自动限速 5MB/s。
-
-3.  **内存智能保护 (Smart Memory Monitor)**
-    *   内置监控模块，当系统内存占用超过 90% 时自动减少并发下载线程数，防止低配机器卡死；内存恢复正常 (<80%) 后自动恢复并发数。
-
----
-
 ## 功能特性概览
 
 *   **多线程并发**：主刷流量线程 (THREADS) + 额外大文件专用线程 (EXTRA_BACKUP_THREAD)。
 *   **时间窗口控制**：支持三个每日循环窗口，可跨天运行 (如 13:00~次日01:00)。
-*   **分级 URL 策略**：主 URL 优先 -> 备用主 URL -> 备用大文件轮询 (减少单一特征流)。
+*   **分级 URL 策略**：主 URL 优先 -> 备用主 URL -> 备用大文件轮询。
 *   **失败重试机制**：按 RETRY_COUNT / RETRY_DELAY 自动重试。
-*   **统计提示**：主与大文件累计分离，跨越 1GB 打印含平均速度提示。
-*   **systemd 服务化**：安装/卸载、自动重启、开机自启。
-*   **交互菜单**：测速 / 状态 / 日志跟踪。
-*   **线程安全**：`flock` 防并发写。
+*   **总量限速**：LIMIT_MBPS 作为总带宽限制，按活跃线程均分。
+*   **日志与统计**：下载日志 + 小时/天级流量统计日志。
+*   **内存智能保护**：内存高占用时自动缩减主线程并恢复。
+*   **实时监控面板**：展示总速度、线程状态与允许线程上限。
+*   **双测速能力**：被动 RX 监控 + 主动镜像测速。
+*   **服务化**：支持 Systemd 与 OpenWrt Procd 安装/卸载/自启。
 
 ## 适用平台 / 依赖
 
-推荐：Ubuntu / Debian / 其他 systemd + GNU coreutils Linux 发行版。
+推荐：Ubuntu / Debian / 其他 systemd + GNU coreutils Linux 发行版；OpenWrt (Procd)。
 
-必须：bash, curl, flock(util-linux), systemd, GNU date, awk。
+必须：bash, curl, flock(util-linux), systemd 或 procd, GNU date, awk。
 
 ## 快速开始
 
 ```bash
 # 赋予执行权限
-chmod +x Flow_Consumption_Tool_v1.1.sh
+chmod +x Flow_Consumption_Tool_v2.0.sh
 
 # 直接运行进入菜单（前台）
-./Flow_Consumption_Tool_v1.1.sh
+./Flow_Consumption_Tool_v2.0.sh
 ```
 
 ### 菜单选项
-1.  **安装服务**：将脚本部署到系统路径并注册 systemd 服务，支持开机自启。
+1.  **安装服务**：自动安装到 systemd 或 OpenWrt procd。
 2.  **卸载服务**：停止服务并清理文件。
-3.  **临时测速**：测试当前出口带宽。
-4.  **服务状态**：查看 systemctl status。
-5.  **查看日志**：实时追踪 journalctl -f 日志。
+3.  **刷新配置**：修改线程数/限速并重启服务。
+4.  **修改时间窗口**：更新三个时间窗口并重启服务。
+5.  **监控实时网速**：被动监控网口 RX。
+6.  **启动主动测速**：镜像源主动测速。
+7.  **服务状态**：查看服务运行情况。
+8.  **查看日志**：实时追踪日志输出。
+9.  **实时监控面板**：查看总速度与线程状态。
