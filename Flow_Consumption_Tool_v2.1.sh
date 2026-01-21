@@ -2,17 +2,20 @@
 # Flow_Consumption_Tool.sh
 
 # ========== 整体架构概述 ==========
-# 本脚本是一个流量消耗工具，用于在指定时间窗口内连续下载文件以消耗网络流量。
-# 脚本功能实现：多线程下载、时间窗口、限速、主/备用优先、大文件线程、1GB 提示等
-# 模块划分：
-# - 配置模块：定义所有可配置参数，如线程数、URL、时间窗口等。
-# - 菜单模块：提供交互式菜单，用于安装/卸载服务、测速、查看状态和日志。
-# - 时间窗口模块：计算当前时间是否在允许下载的时间窗口内。
-# - 下载模块：执行实际的下载任务，包括重试、限速和流量统计。
-# - 线程管理模块：启动和管理多个下载线程，包括主线程和大文件专用线程。
-# - 保活机制：通过 systemd 服务实现自动重启和后台运行。
-# - 状态持久化：使用临时文件记录累计下载字节数。
-# - 日志与监控：输出下载进度、速度和错误信息。
+# 本脚本是一个流量消耗工具，用于在指定时间窗口内持续下载，以维持稳定下行流量。
+# 关键能力：多线程并发、时间窗口、总量限速均分、主/备用URL降级、大文件专用线程、
+#           1GB 里程碑提示、内存监控降载、实时面板与日志统计、服务化运行。
+# 模块划分（与代码区域对应）：
+# - 配置与入口：统一参数区 + 环境变量加载，保证交互模式与服务模式一致。
+# - 菜单交互：安装/卸载服务、刷新配置、改时间窗、测速、状态与日志查看。
+# - 时间窗口调度：计算三段每日窗口（支持跨天）并驱动线程启停节奏。
+# - 下载执行：按限速下载到 /dev/null，统计字节与耗时，失败按重试策略退避。
+# - URL 策略：主URL -> 备用主URL -> 备用大文件轮询，保障连续流量。
+# - 线程管理：主线程池 + 专用大文件线程，运行中可被内存监控动态降载。
+# - 资源保护：内存占用高时减少主线程并回升，避免系统被压垮。
+# - 状态与监控：状态文件 + 实时面板展示线程状态、总速、IP 等信息。
+# - 统计与日志：运行日志 + 小时/天级流量统计，支持简易轮转。
+# - 服务化：Systemd / OpenWrt Procd 安装、卸载、自启与守护。
 
 # set -euo pipefail # 禁用严格模式，防止网络波动或外部命令(如grep/curl)返回非0导致线程崩溃
 
@@ -78,6 +81,8 @@ MAINTOTAL_FILE=${MAINTOTAL_FILE:-/tmp/Flow_Consumption_Tool_main_total.bytes}
 BACKUPTOTAL_FILE=${BACKUPTOTAL_FILE:-/tmp/Flow_Consumption_Tool_backup_total.bytes}
 # 新增：用于存储当前动态允许的主线程数
 THREADS_FILE=${THREADS_FILE:-/tmp/Flow_Consumption_Tool_active_threads}
+# 新增：卸载时的停止标记，阻止残留进程继续刷流量
+STOP_FILE=${STOP_FILE:-/tmp/Flow_Consumption_Tool.stop}
 
 # 新增：状态文件目录，用于Dashboard监控
 STATUS_DIR="/tmp/Flow_Consumption_Tool_status"
@@ -152,8 +157,35 @@ run_as_root() {
   return 2
 }
 
+# 统一判断是否需要停止（收到信号或存在停止标记）
+should_stop() {
+  [ "$STOP" -ne 0 ] && return 0
+  [ -f "$STOP_FILE" ] && return 0
+  return 1
+}
+
+# OpenWrt: 尽量彻底停止并解绑 procd 服务
+openwrt_force_stop_service() {
+  local init_script="/etc/init.d/${SERVICE_NAME}"
+
+  if [ -x "$init_script" ]; then
+    run_as_root "$init_script" stop 2>/dev/null || true
+    run_as_root "$init_script" disable 2>/dev/null || true
+  fi
+
+  # 通过 ubus 再次尝试停止 procd 实例
+  if command -v ubus >/dev/null 2>&1; then
+    run_as_root ubus call service stop "{\"name\":\"${SERVICE_NAME}\"}" 2>/dev/null || true
+  fi
+
+  # 清理 rc.d 启动链接
+  run_as_root rm -f /etc/rc.d/*"${SERVICE_NAME}"* 2>/dev/null || true
+}
+
 # 交互式安装服务：自动适配 Systemd 或 OpenWrt Procd。
 install_service_interactive() {
+  # 安装时清除停止标记，允许服务运行
+  run_as_root rm -f "$STOP_FILE" 2>/dev/null || true
   echo "安装服务：正在检测环境并配置..."
   echo "当前默认时间窗口:"
   echo "  1) ${START_TIME_1} - ${END_TIME_1}"
@@ -274,6 +306,8 @@ refresh_config_interactive() {
   if ! ensure_sudo; then
     return 1
   fi
+  # 刷新配置时清除停止标记，允许服务运行
+  run_as_root rm -f "$STOP_FILE" 2>/dev/null || true
   echo "刷新配置：更新线程数与限速"
 
   read -p "请输入额外主线程数 (0-16, 直接回车保持不变): " threads_input
@@ -332,6 +366,8 @@ modify_time_window_interactive() {
   if ! ensure_sudo; then
     return 1
   fi
+  # 修改窗口时清除停止标记，允许服务运行
+  run_as_root rm -f "$STOP_FILE" 2>/dev/null || true
   echo "修改时间窗口 (格式 HH:MM，直接回车保持不变)"
 
   read -p "窗口1 开始(${START_TIME_1}): " s1
@@ -401,80 +437,49 @@ uninstall_service_interactive() {
     return 0
   fi
   
+  # 简化清理逻辑：关闭自启动 -> 停止服务 -> 清理进程
+  local OTHER_SERVICE="continuous_download"
+  local OTHER_SCRIPT="/usr/local/bin/continuous_download.sh"
+
   if is_openwrt; then
-     INIT_SCRIPT="/etc/init.d/${SERVICE_NAME}"
-     if [ -f "$INIT_SCRIPT" ] || [ -L "$INIT_SCRIPT" ]; then
-        echo "正在停止 OpenWrt 服务..."
-        run_as_root "$INIT_SCRIPT" disable 2>/dev/null || true
-        run_as_root "$INIT_SCRIPT" stop 2>/dev/null || true
-        # 给 Procd 一点反应时间
-        sleep 2
-        run_as_root rm -f "$INIT_SCRIPT"
-     fi
+    local INIT_SCRIPT="/etc/init.d/${SERVICE_NAME}"
+    local OTHER_INIT_SCRIPT="/etc/init.d/${OTHER_SERVICE}"
+    echo "[1/3] 关闭自启动与服务"
+    [ -x "$INIT_SCRIPT" ] && run_as_root "$INIT_SCRIPT" stop 2>/dev/null || true
+    [ -x "$INIT_SCRIPT" ] && run_as_root "$INIT_SCRIPT" disable 2>/dev/null || true
+    [ -x "$OTHER_INIT_SCRIPT" ] && run_as_root "$OTHER_INIT_SCRIPT" stop 2>/dev/null || true
+    [ -x "$OTHER_INIT_SCRIPT" ] && run_as_root "$OTHER_INIT_SCRIPT" disable 2>/dev/null || true
+    if command -v ubus >/dev/null 2>&1; then
+      run_as_root ubus call service stop "{\"name\":\"${SERVICE_NAME}\"}" 2>/dev/null || true
+      run_as_root ubus call service stop "{\"name\":\"${OTHER_SERVICE}\"}" 2>/dev/null || true
+    fi
+    run_as_root rm -f /etc/rc.d/*"${SERVICE_NAME}"* /etc/rc.d/*"${OTHER_SERVICE}"* 2>/dev/null || true
+    run_as_root rm -f "$INIT_SCRIPT" "$OTHER_INIT_SCRIPT" 2>/dev/null || true
   else
-     run_as_root systemctl disable --now "${SERVICE_NAME}.service" 2>/dev/null || true
-     run_as_root rm -f "$UNIT_PATH" 2>/dev/null
-     run_as_root systemctl daemon-reload 2>/dev/null || true
-  fi
-  
-  # 递归查找所有相关 PID (父进程 + 子进程 + 孙进程)
-  # 避免残留子进程或 Procd 重启后的新进程
-  echo "正在扫描残留进程..."
-  local retry=0
-  while [ $retry -lt 10 ]; do
-      # 1. 查找主进程
-      local main_pids
-      main_pids=$(pgrep -f "${DEST_BIN}" | grep -v "$$" | tr '\n' ' ')
-      
-      # 2. 查找孤儿 curl 进程
-      local orphan_curls
-      orphan_curls=$(pgrep -f "curl -s --max-time 120 --limit-rate" | grep -v "$$" | tr '\n' ' ')
-      
-      local all_pids="$main_pids $orphan_curls"
-      # 去重并规范化
-        all_pids=$(echo "$all_pids" | tr ' ' '\n' | sort -u | tr '\n' ' ')
-        all_pids=$(echo "$all_pids" | awk '{$1=$1;print}')
-      
-      if [ -z "$all_pids" ]; then
-          echo "进程已清理干净。"
-          break
-      fi
-      
-      echo "发现残留进程 (尝试 $retry/10): $all_pids"
-      
-      # 递归查找子进程并构建杀戮列表
-      local kill_list="$all_pids"
-      for p in $all_pids; do
-          # 查找直接子进程
-          local kids=$(pgrep -P "$p" 2>/dev/null | tr '\n' ' ')
-          if [ -n "$kids" ]; then
-             kill_list="$kill_list $kids"
-             # 查找孙进程
-             for k in $kids; do
-                 local grandkids=$(pgrep -P "$k" 2>/dev/null | tr '\n' ' ')
-                 [ -n "$grandkids" ] && kill_list="$kill_list $grandkids"
-             done
-          fi
-      done
-      
-      # 再次去重
-      kill_list=$(echo "$kill_list" | tr ' ' '\n' | sort -u | tr '\n' ' ')
-      
-      if [ -n "$kill_list" ]; then
-         echo "强制终止 PID: $kill_list"
-         for pid in $kill_list; do
-             run_as_root kill -9 "$pid" 2>/dev/null || true
-         done
-      fi
-      
-      sleep 1
-      retry=$((retry+1))
-  done
-  
-  if [ $retry -ge 10 ]; then
-     echo "警告：部分进程可能即便强制终止也未能清理，或 Procd 仍在不断重启服务。"
+    echo "[1/3] 关闭自启动与服务"
+    run_as_root systemctl stop "${SERVICE_NAME}.service" 2>/dev/null || true
+    run_as_root systemctl disable "${SERVICE_NAME}.service" 2>/dev/null || true
+    run_as_root systemctl reset-failed "${SERVICE_NAME}.service" 2>/dev/null || true
+    run_as_root systemctl stop "${OTHER_SERVICE}.service" 2>/dev/null || true
+    run_as_root systemctl disable "${OTHER_SERVICE}.service" 2>/dev/null || true
+    run_as_root systemctl reset-failed "${OTHER_SERVICE}.service" 2>/dev/null || true
+    run_as_root rm -f "$UNIT_PATH" "/etc/systemd/system/${OTHER_SERVICE}.service" 2>/dev/null
+    run_as_root systemctl daemon-reload 2>/dev/null || true
   fi
 
+  echo "[2/3] 清理残留进程"
+  if command -v pkill >/dev/null 2>&1; then
+    pkill -9 -f "${SERVICE_NAME}" 2>/dev/null || true
+    pkill -9 -f "${SERVICE_NAME}\.sh" 2>/dev/null || true
+    pkill -9 -f "${OTHER_SERVICE}" 2>/dev/null || true
+    pkill -9 -f "${OTHER_SCRIPT}" 2>/dev/null || true
+    pkill -9 -f "curl -s --max-time 120" 2>/dev/null || true
+  fi
+
+  # 清理临时状态文件，避免卸载后面板显示旧状态
+  echo "[3/3] 清理残留文件"
+  run_as_root rm -f "$MAINTOTAL_FILE" "$BACKUPTOTAL_FILE" "$THREADS_FILE" "$LOCKFILE" "$STOP_FILE"
+  run_as_root rm -rf "$STATUS_DIR"
   run_as_root rm -f "$DEST_BIN" "$ENV_PATH"
   echo "已卸载服务并移除文件。"
 }
@@ -723,12 +728,85 @@ view_logs_interactive() {
 # -----------------------------------
 # 实时监控面板 (Dashboard)
 # -----------------------------------
+# 读取状态文件并判断是否过期（超过指定秒数即视为已停止）
+get_status_text() {
+  local sfile="$1"
+  local default_text="$2"
+  local max_age="$3"
+  local state="${default_text}"
+
+  if [ -f "$sfile" ]; then
+    state=$(cat "$sfile" 2>/dev/null || echo "$default_text")
+    local now_ts file_ts
+    now_ts=$(date +%s)
+    file_ts=$(stat -c %Y "$sfile" 2>/dev/null || echo 0)
+    if ! [[ "$file_ts" =~ ^[0-9]+$ ]]; then
+      file_ts=0
+    fi
+    if [ "$file_ts" -gt 0 ] && [ $((now_ts - file_ts)) -gt "$max_age" ]; then
+      state="已停止"
+    fi
+  fi
+  printf "%s" "$state"
+}
+
 show_dashboard() {
   # 尝试自动检测主网卡
   local interface
-  interface=$(ip route | grep default | awk '{print $5}' | head -n1)
+  local lan_ip="无"
+  local wan_ipv4="无"
+  local wan_ipv6="无"
+  local lan_iface=""
+
+  # 工具函数：获取指定接口的 IPv4/IPv6（仅 global，排除 link-local）
+  get_ipv4_global() {
+    ip -4 addr show dev "$1" scope global 2>/dev/null | awk '/inet /{print $2}' | head -n1
+  }
+  get_ipv6_global() {
+    ip -6 addr show dev "$1" scope global 2>/dev/null | awk '/inet6 /{print $2}' | head -n1
+  }
+
+  # WAN 接口选择策略：先匹配包含 wan 的接口名，再回退默认路由
+  local wan_if4="" wan_if6=""
+  if command -v ip >/dev/null 2>&1; then
+    for ifn in $(ip -o link show 2>/dev/null | awk -F': ' '{print $2}'); do
+      case "$ifn" in
+        *wan*|*WAN*)
+          [ -z "$wan_if4" ] && [ -n "$(get_ipv4_global "$ifn")" ] && wan_if4="$ifn"
+          [ -z "$wan_if6" ] && [ -n "$(get_ipv6_global "$ifn")" ] && wan_if6="$ifn"
+          ;;
+      esac
+    done
+  fi
+  [ -z "$wan_if4" ] && wan_if4=$(ip -4 route 2>/dev/null | awk '/^default/{print $5; exit}')
+  [ -z "$wan_if6" ] && wan_if6=$(ip -6 route 2>/dev/null | awk '/^default/{print $5; exit}')
+  interface="$wan_if4"
+  [ -z "$interface" ] && interface="$wan_if6"
   [ -z "$interface" ] && interface=$(get_default_iface)
   [ -z "$interface" ] && interface="eth0"
+
+  # OpenWrt: LAN 通常为 br-lan
+  if command -v ip >/dev/null 2>&1; then
+    if ip link show br-lan >/dev/null 2>&1; then
+      lan_iface="br-lan"
+    fi
+  fi
+
+  # 获取 LAN IP
+  if [ -n "$lan_iface" ]; then
+    lan_ip=$(get_ipv4_global "$lan_iface")
+  else
+    lan_ip=$(get_ipv4_global "$interface")
+  fi
+  [ -z "$lan_ip" ] && lan_ip="无"
+
+  # 获取 WAN IPv4/IPv6（分别从 IPv4/IPv6 默认路由接口）
+  [ -z "$wan_if4" ] && wan_if4="$interface"
+  [ -z "$wan_if6" ] && wan_if6="$interface"
+  wan_ipv4=$(get_ipv4_global "$wan_if4")
+  wan_ipv6=$(get_ipv6_global "$wan_if6")
+  [ -z "$wan_ipv4" ] && wan_ipv4="无"
+  [ -z "$wan_ipv6" ] && wan_ipv6="无"
 
   echo "正在启动监控面板... (监测接口: $interface)"
   sleep 1
@@ -748,6 +826,9 @@ show_dashboard() {
   printf "\033[H"
 
   while true; do
+    # 动态刷新配置，确保面板显示与最新配置一致
+    load_env
+
     # 计算网卡实时流量
     local r1 r2 t1 t2 delta_t delta_b speed mem
     r1=$(grep "$interface" /proc/net/dev 2>/dev/null | awk '{print $2}')
@@ -780,12 +861,29 @@ show_dashboard() {
       allowed=$THREADS
     fi
 
+    # 如果全部状态均已停止，则活跃主线程数显示为 0
+    if [ "$THREADS" -gt 0 ]; then
+      local active_count=0
+      for i in $(seq 0 $((THREADS-1))); do
+        local sfile_check="${STATUS_DIR}/thread_${i}.status"
+        local state_check
+        state_check=$(get_status_text "$sfile_check" "已停止" 15)
+        if [ "$state_check" != "已停止" ]; then
+          active_count=$((active_count + 1))
+        fi
+      done
+      allowed=$active_count
+    fi
+
     render_buf=""
     render_buf+="=========================================================="$'\n'
     render_buf+=" >> 流量消耗工具 - 实时监控面板 (Enter返回主菜单)"$'\n'
     render_buf+="=========================================================="$'\n'
     render_buf+=" 当前时间     : $(date '+%H:%M:%S')"$'\n'
     render_buf+=" 运行窗口     : ${START_TIME_1}-${END_TIME_1}, ${START_TIME_2}-${END_TIME_2}, ${START_TIME_3}-${END_TIME_3}"$'\n'
+    render_buf+=" 局域网IP地址: ${lan_ip}"$'\n'
+    render_buf+=" 出接口IPv4  : ${wan_ipv4}"$'\n'
+    render_buf+=" 出接口IPv6  : ${wan_ipv6}"$'\n'
     render_buf+=" --------------------------------------------------------"$'\n'
     render_buf+=" 接口总流量速 : ${speed} MB/s (Limit: ${LIMIT_MBPS} MB/s)"$'\n'
     render_buf+=" 内存占用     : ${mem}%  (动态限制阈值: 90%)"$'\n'
@@ -796,8 +894,8 @@ show_dashboard() {
     if [ "$THREADS" -gt 0 ]; then
       for i in $(seq 0 $((THREADS-1))); do
         local sfile="${STATUS_DIR}/thread_${i}.status"
-        local state="Waiting..."
-        [ -f "$sfile" ] && state=$(cat "$sfile")
+        local state
+        state=$(get_status_text "$sfile" "Waiting..." 15)
         render_buf+=" Main-$i       | ${state}"$'\n'
       done
     else
@@ -807,8 +905,8 @@ show_dashboard() {
     render_buf+=" -------------+------------------------------------------"$'\n'
     for i in $(seq 1 $EXTRA_BACKUP_THREAD); do
       local sfile="${STATUS_DIR}/backup_${i}.status"
-      local state="Waiting..."
-      [ -f "$sfile" ] && state=$(cat "$sfile")
+      local state
+      state=$(get_status_text "$sfile" "Waiting..." 15)
       render_buf+=" Backup-$i     | ${state}"$'\n'
     done
     render_buf+="=========================================================="$'\n'
@@ -851,6 +949,18 @@ fi
 
 # 在服务模式下也加载环境变量
 load_env
+
+# 若存在停止标记，则直接退出（避免卸载后残留实例继续运行）
+if [ -f "$STOP_FILE" ]; then
+  echo "检测到停止标记 $STOP_FILE，服务模式直接退出。"
+  exit 0
+fi
+
+# 若限制为 0 或无线程，则直接退出（不消耗流量）
+if [ "${LIMIT_MBPS:-0}" -le 0 ] || { [ "${THREADS:-0}" -le 0 ] && [ "${EXTRA_BACKUP_THREAD:-0}" -le 0 ]; }; then
+  echo "当前参数为零消耗模式，服务模式直接退出。"
+  exit 0
+fi
 
 # 初始化
 mkdir -p "$(dirname "$MAINTOTAL_FILE")"
@@ -1051,7 +1161,7 @@ thread_worker() {
   local id="$1"
   local t_name="thread_${id}"
   local backup_index="$id"
-  while [ "$STOP" -eq 0 ]; do
+  while ! should_stop; do
     # --- 新增动态内存限制检测 ---
     # 读取当前允许的最大线程数，如果本线程ID >= 允许数，则暂停不工作
     allowed_threads=$(cat "$THREADS_FILE" 2>/dev/null || echo "$THREADS")
@@ -1081,11 +1191,11 @@ thread_worker() {
       sleep $((start_epoch - now_epoch))
     fi
     # 在窗口内循环
-    while [ "$(date +%s)" -lt "$end_epoch" ] && [ "$STOP" -eq 0 ]; do
+    while [ "$(date +%s)" -lt "$end_epoch" ] && ! should_stop; do
       # 1) 主 URL
       attempt=0
       success=0
-      while [ $attempt -le $RETRY_COUNT ] && [ "$(date +%s)" -lt "$end_epoch" ] && [ "$STOP" -eq 0 ]; do
+      while [ $attempt -le $RETRY_COUNT ] && [ "$(date +%s)" -lt "$end_epoch" ] && ! should_stop; do
         attempt=$((attempt+1))
         update_mode_status "$t_name" "下载主URL (尝试 $attempt)"
         # 优化：移除进程替换
@@ -1097,7 +1207,7 @@ thread_worker() {
           success=1
           break
         else
-          if [ $attempt -le $RETRY_COUNT ] && [ "$STOP" -eq 0 ]; then
+          if [ $attempt -le $RETRY_COUNT ] && ! should_stop; then
             sleep "$RETRY_DELAY"
           fi
         fi
@@ -1109,7 +1219,7 @@ thread_worker() {
       # 2) 备用主 URL
       attempt=0
       success=0
-      while [ $attempt -le $RETRY_COUNT ] && [ "$(date +%s)" -lt "$end_epoch" ] && [ "$STOP" -eq 0 ]; do
+      while [ $attempt -le $RETRY_COUNT ] && [ "$(date +%s)" -lt "$end_epoch" ] && ! should_stop; do
         attempt=$((attempt+1))
         update_mode_status "$t_name" "下载备用URL (尝试 $attempt)"
         # 优化：移除进程替换 < <(...) 以减少子进程和孤儿进程风险
@@ -1122,7 +1232,7 @@ thread_worker() {
           success=1
           break
         else
-          if [ $attempt -le $RETRY_COUNT ] && [ "$STOP" -eq 0 ]; then
+          if [ $attempt -le $RETRY_COUNT ] && ! should_stop; then
             sleep "$RETRY_DELAY"
           fi
         fi
@@ -1137,7 +1247,7 @@ thread_worker() {
       attempt=0
       file_bytes=0
       file_duration=0
-      while [ $attempt -le $RETRY_COUNT ] && [ "$(date +%s)" -lt "$end_epoch" ] && [ "$STOP" -eq 0 ]; do
+      while [ $attempt -le $RETRY_COUNT ] && [ "$(date +%s)" -lt "$end_epoch" ] && ! should_stop; do
         attempt=$((attempt+1))
         update_mode_status "$t_name" "下载大文件 (尝试 $attempt)"
         # 优化：移除进程替换
@@ -1150,7 +1260,7 @@ thread_worker() {
           update_main_total "$size" "$url" "$dur"
           break
         else
-          if [ $attempt -le $RETRY_COUNT ] && [ "$STOP" -eq 0 ]; then
+          if [ $attempt -le $RETRY_COUNT ] && ! should_stop; then
             sleep "$RETRY_DELAY"
           fi
         fi
@@ -1158,7 +1268,7 @@ thread_worker() {
 
       # 备用大文件下载后等待（如有剩余窗口时间）
       now_epoch=$(date +%s)
-      if [ "$now_epoch" -ge "$end_epoch" ] || [ "$STOP" -ne 0 ]; then
+      if [ "$now_epoch" -ge "$end_epoch" ] || should_stop; then
         break
       fi
       sleep_time=$SLEEP_BETWEEN_DOWNLOADS
@@ -1188,7 +1298,7 @@ backup_thread_worker() {
   local t_name="backup_${id}"
   local backup_index=0
   echo "[专用大文件线程] 启动：线程索引起始=${backup_index}" 
-  while [ "$STOP" -eq 0 ]; do
+  while ! should_stop; do
     w_out=$(get_next_window)
     read start_epoch end_epoch <<< "$w_out"
     now_epoch=$(date +%s)
@@ -1196,13 +1306,13 @@ backup_thread_worker() {
       update_mode_status "$t_name" "等待窗口: $(date -d @$start_epoch '+%H:%M')"
       sleep $((start_epoch - now_epoch))
     fi
-    while [ "$(date +%s)" -lt "$end_epoch" ] && [ "$STOP" -eq 0 ]; do
+    while [ "$(date +%s)" -lt "$end_epoch" ] && ! should_stop; do
       url="${BACKUP_URLS[$((backup_index % ${#BACKUP_URLS[@]}))]}"
       backup_index=$((backup_index+1))
       attempt=0
       file_bytes=0
       file_duration=0
-      while [ $attempt -le $RETRY_COUNT ] && [ "$(date +%s)" -lt "$end_epoch" ] && [ "$STOP" -eq 0 ]; do
+      while [ $attempt -le $RETRY_COUNT ] && [ "$(date +%s)" -lt "$end_epoch" ] && ! should_stop; do
         attempt=$((attempt+1))
         update_mode_status "$t_name" "下载中 (大文件)"
         # 优化：移除进程替换
@@ -1222,14 +1332,14 @@ backup_thread_worker() {
           printf "[专用大文件线程] 下载完成: %d bytes, 耗时: %.3f s, 平均速度: %s Mbps, 链接: %s\n" "$size" "$dur" "$avg_speed" "$url"
           break
         else
-          if [ $attempt -le $RETRY_COUNT ] && [ "$STOP" -eq 0 ]; then
+          if [ $attempt -le $RETRY_COUNT ] && ! should_stop; then
             update_mode_status "$t_name" "重试等待"
             sleep "$RETRY_DELAY"
           fi
         fi
       done
       now_epoch=$(date +%s)
-      if [ "$now_epoch" -ge "$end_epoch" ] || [ "$STOP" -ne 0 ]; then
+      if [ "$now_epoch" -ge "$end_epoch" ] || should_stop; then
         break
       fi
       sleep_time=$SLEEP_BETWEEN_DOWNLOADS
@@ -1286,7 +1396,7 @@ monitor_stats() {
 
   echo "[Monitor Stats] 流量监控已启动"
 
-  while [ "$STOP" -eq 0 ]; do
+  while ! should_stop; do
     sleep 60
     
     local now_sec now_hour_str now_day_str
@@ -1394,7 +1504,7 @@ monitor_memory() {
   
   echo "[Memory Monitor] 启动内存监控，目标控制在 80%-90% 之间"
 
-  while [ "$STOP" -eq 0 ]; do
+  while ! should_stop; do
     # 增加容错：在 OpenWrt/BusyBox 下 free 输出可能不同，防止 grep/awk 失败导致 set -e 退出
     # 尝试多种获取方式
     mem_percent=0

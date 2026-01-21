@@ -1,4 +1,4 @@
-# Flow Consumption Tool (v2.0)
+# Flow Consumption Tool (v2.1)
 
 [简体中文](README.md) | English
 
@@ -20,9 +20,9 @@ A continuous, time-windowed, rate-limited, multi-threaded download traffic consu
 *   **Tiered URL strategy**: main URL -> secondary URL -> rotating backup large files.
 *   **Retry logic**: RETRY_COUNT / RETRY_DELAY based retries.
 *   **Total bandwidth limit**: LIMIT_MBPS caps total bandwidth and is split across active threads.
-*   **Logs & stats**: runtime log + hourly/daily traffic stats logs.
+*   **Logs & stats**: runtime log + hourly/daily traffic stats logs (with simple rotation).
 *   **Smart memory guard**: reduce threads on high memory usage, restore on recovery.
-*   **Real-time dashboard**: total speed, thread status, allowed threads.
+*   **Real-time dashboard**: total speed, thread state, memory and IP info.
 *   **Dual speed tests**: passive RX monitor + active mirror download test.
 *   **Service mode**: Systemd and OpenWrt Procd install/uninstall/autostart.
 
@@ -35,8 +35,8 @@ Required: bash, curl, flock(util-linux), systemd or procd, GNU date, awk.
 ## Quick Start
 
 ```bash
-chmod +x Flow_Consumption_Tool_v2.0.sh
-./Flow_Consumption_Tool_v2.0.sh
+chmod +x Flow_Consumption_Tool_v2.1.sh
+./Flow_Consumption_Tool_v2.1.sh
 ```
 
 ## Menu Options

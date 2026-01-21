@@ -1,4 +1,4 @@
-# Flow Consumption Tool / 流量消耗工具 (v2.0)
+# Flow Consumption Tool / 流量消耗工具 (v2.1)
 
 简体中文 | [English](README.en.md)
 
@@ -20,9 +20,9 @@
 *   **分级 URL 策略**：主 URL 优先 -> 备用主 URL -> 备用大文件轮询。
 *   **失败重试机制**：按 RETRY_COUNT / RETRY_DELAY 自动重试。
 *   **总量限速**：LIMIT_MBPS 作为总带宽限制，按活跃线程均分。
-*   **日志与统计**：下载日志 + 小时/天级流量统计日志。
+*   **日志与统计**：下载日志 + 小时/天级流量统计日志（含简易轮转）。
 *   **内存智能保护**：内存高占用时自动缩减主线程并恢复。
-*   **实时监控面板**：展示总速度、线程状态与允许线程上限。
+*   **实时监控面板**：展示总速度、线程状态、内存与 IP 信息。
 *   **双测速能力**：被动 RX 监控 + 主动镜像测速。
 *   **服务化**：支持 Systemd 与 OpenWrt Procd 安装/卸载/自启。
 
@@ -36,10 +36,10 @@
 
 ```bash
 # 赋予执行权限
-chmod +x Flow_Consumption_Tool_v2.0.sh
+chmod +x Flow_Consumption_Tool_v2.1.sh
 
 # 直接运行进入菜单（前台）
-./Flow_Consumption_Tool_v2.0.sh
+./Flow_Consumption_Tool_v2.1.sh
 ```
 
 ### 菜单选项
